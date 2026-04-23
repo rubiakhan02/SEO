@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+:root {
+  --color-bg: #f8fafc;
+  --color-fg: #0f172a;
+  --font-sans-custom: "Segoe UI", "Aptos", "Trebuchet MS", sans-serif;
+  --font-mono-custom: "Consolas", "Cascadia Code", monospace;
+}
+
+@theme inline {
+  --font-sans: var(--font-sans-custom);
+  --font-mono: var(--font-mono-custom);
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans-custom);
+}

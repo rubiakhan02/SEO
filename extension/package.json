@@ -1,0 +1,11 @@
+{
+  "name": "seo-rank-extension",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "build": "..\\apps\\web\\node_modules\\.bin\\tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.24"
+  }
+}
