@@ -9,7 +9,8 @@
     "https://www.google.com/*",
     "https://www.google.co.in/*",
     "http://localhost:3000/*",
-    "https://*.vercel.app/*"
+    "https://*.vercel.app/*",
+    "https://seo-54kh.onrender.com/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -22,7 +23,8 @@
   "externally_connectable": {
     "matches": [
       "http://localhost:3000/*",
-      "https://*.vercel.app/*"
+      "https://*.vercel.app/*",
+      "https://seo-54kh.onrender.com/*"
     ]
   }
 }
