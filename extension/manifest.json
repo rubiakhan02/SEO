@@ -4,7 +4,7 @@
   "description": "Scrapes Google results from the employee browser session for internal rank checks.",
   "version": "1.0.0",
   "incognito": "spanning",
-  "permissions": ["tabs", "windows"],
+  "permissions": ["tabs", "windows", "scripting"],
   "host_permissions": [
     "https://www.google.com/*",
     "https://www.google.co.in/*",
@@ -19,16 +19,6 @@
     "default_title": "Company SEO Rank Checker",
     "default_popup": "popup.html"
   },
-  "content_scripts": [
-    {
-      "matches": [
-        "https://www.google.com/*",
-        "https://www.google.co.in/*"
-      ],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "externally_connectable": {
     "matches": [
       "http://localhost:3000/*",

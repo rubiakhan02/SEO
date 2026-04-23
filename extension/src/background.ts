@@ -1,12 +1,20 @@
 const REQUEST_TIMEOUT_MS = 240000;
+const TAB_LOAD_TIMEOUT_MS = 12000;
 const GOOGLE_PAGE_STARTS = Array.from({ length: 10 }, (_, index) => index * 10);
 const RESULTS_PER_PAGE = 10;
-const CONTENT_SCRIPT_RETRY_DELAY_MS = 400;
-const CONTENT_SCRIPT_MAX_RETRIES = 12;
+const MAX_PAGE_ATTEMPTS = 3;
+const PAGE_RETRY_DELAY_MS = 2000;
 const INCOGNITO_WARNING_MESSAGE =
   "Please enable incognito access for this extension. Go to chrome://extensions, click Details on the Rank Checker extension, and turn on Allow in Incognito. Then reload the extension.";
 const MIN_PAGE_DELAY_MS = 2000;
 const MAX_PAGE_DELAY_MS = 3500;
+
+type ParsedSearchResult = {
+  position: number;
+  url: string;
+  title: string;
+  snippet: string;
+};
 
 type PendingRequest = {
   requestId: string;
@@ -14,11 +22,14 @@ type PendingRequest = {
   targetDomain: string;
   windowId: number | null;
   tabId: number | null;
+  parseStartedTabId: number | null;
   currentStart: number;
   currentPageIndex: number;
+  currentPageAttempt: number;
   pagesScanned: number;
-  collectedResults: unknown[];
+  collectedResults: ParsedSearchResult[];
   timeoutId: number;
+  tabLoadTimeoutId: number | null;
   sendResponse: (response: unknown) => void;
 };
 
@@ -79,19 +90,19 @@ function isDomainMatch(urlValue: unknown, targetDomain: string): boolean {
   }
 }
 
-function hasTargetDomain(results: unknown[], targetDomain: string): boolean {
+function hasTargetDomain(results: ParsedSearchResult[], targetDomain: string): boolean {
   if (!targetDomain) {
     return false;
   }
 
-  return results.some((item) => {
-    if (!item || typeof item !== "object") {
-      return false;
-    }
+  return results.some((result) => isDomainMatch(result.url, targetDomain));
+}
 
-    const result = item as { url?: unknown };
-    return isDomainMatch(result.url, targetDomain);
-  });
+function clearTabLoadTimeout(pending: PendingRequest): void {
+  if (pending.tabLoadTimeoutId !== null) {
+    clearTimeout(pending.tabLoadTimeoutId);
+    pending.tabLoadTimeoutId = null;
+  }
 }
 
 function attachIncognitoTabToRequest(requestId: string, windowId: number): void {
@@ -125,7 +136,20 @@ function attachIncognitoTabToRequest(requestId: string, windowId: number): void 
 
     pending.windowId = windowId;
     pending.tabId = firstTab.id;
+    pending.parseStartedTabId = null;
     pendingByTabId.set(firstTab.id, requestId);
+
+    clearTabLoadTimeout(pending);
+    pending.tabLoadTimeoutId = setTimeout(() => {
+      const activePending = pendingByRequestId.get(requestId);
+      if (!activePending || activePending.tabId !== firstTab.id) {
+        return;
+      }
+
+      closeCurrentIncognitoTab(requestId, () => {
+        handlePageAttemptFailure(requestId, "TAB_LOAD_TIMEOUT");
+      });
+    }, TAB_LOAD_TIMEOUT_MS);
   });
 }
 
@@ -163,8 +187,10 @@ function closeCurrentIncognitoTab(requestId: string, onClosed: () => void): void
   const tabId = pending.tabId;
   const windowId = pending.windowId;
 
+  clearTabLoadTimeout(pending);
   pending.tabId = null;
   pending.windowId = null;
+  pending.parseStartedTabId = null;
 
   if (tabId) {
     pendingByTabId.delete(tabId);
@@ -201,6 +227,7 @@ function cleanupRequest(requestId: string): void {
   }
 
   clearTimeout(pending.timeoutId);
+  clearTabLoadTimeout(pending);
   pendingByRequestId.delete(requestId);
   if (pending.tabId) {
     pendingByTabId.delete(pending.tabId);
@@ -227,7 +254,7 @@ function finalizeRequest(requestId: string): void {
   }
 
   const mergedResults = pending.collectedResults.map((result, index) => ({
-    ...(result as Record<string, unknown>),
+    ...result,
     position: index + 1,
   }));
 
@@ -244,24 +271,6 @@ function finalizeRequest(requestId: string): void {
   cleanupRequest(requestId);
 }
 
-function openNextSearchPage(requestId: string): void {
-  const pending = pendingByRequestId.get(requestId);
-  if (!pending) {
-    return;
-  }
-
-  if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
-    finalizeRequest(requestId);
-    return;
-  }
-
-  const start = GOOGLE_PAGE_STARTS[pending.currentPageIndex];
-  pending.currentStart = start;
-  const pageUrl = buildGoogleSearchUrl(pending.keyword, start);
-  console.log(`[Rank Checker] Fetching Google URL: ${pageUrl}`);
-  openFreshIncognitoTab(requestId, pageUrl);
-}
-
 function scheduleNextSearchPage(requestId: string): void {
   const pending = pendingByRequestId.get(requestId);
   if (!pending) {
@@ -274,39 +283,277 @@ function scheduleNextSearchPage(requestId: string): void {
   }, delayMs);
 }
 
-function requestContentParse(tabId: number, requestId: string, attempt = 0): void {
+function processPageResults(requestId: string, results: ParsedSearchResult[]): void {
   const pending = pendingByRequestId.get(requestId);
   if (!pending) {
     return;
   }
 
-  chrome.tabs.sendMessage(
-    tabId,
+  pending.pagesScanned += 1;
+
+  if (results.length > 0) {
+    pending.collectedResults.push(...results);
+    if (hasTargetDomain(results, pending.targetDomain)) {
+      finalizeRequest(requestId);
+      return;
+    }
+  }
+
+  pending.currentPageIndex += 1;
+  pending.currentPageAttempt = 0;
+
+  if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
+    finalizeRequest(requestId);
+    return;
+  }
+
+  scheduleNextSearchPage(requestId);
+}
+
+function handlePageAttemptFailure(requestId: string, reason: string): void {
+  const pending = pendingByRequestId.get(requestId);
+  if (!pending) {
+    return;
+  }
+
+  const pageNumber = pending.currentPageIndex + 1;
+  console.warn(
+    `[Rank Checker] Page ${pageNumber} attempt ${pending.currentPageAttempt}/${MAX_PAGE_ATTEMPTS} failed: ${reason}`,
+  );
+
+  if (pending.currentPageAttempt < MAX_PAGE_ATTEMPTS) {
+    setTimeout(() => {
+      openSearchPageAttempt(requestId);
+    }, PAGE_RETRY_DELAY_MS);
+    return;
+  }
+
+  pending.pagesScanned += 1;
+  pending.currentPageIndex += 1;
+  pending.currentPageAttempt = 0;
+
+  if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
+    finalizeRequest(requestId);
+    return;
+  }
+
+  scheduleNextSearchPage(requestId);
+}
+
+function openSearchPageAttempt(requestId: string): void {
+  const pending = pendingByRequestId.get(requestId);
+  if (!pending) {
+    return;
+  }
+
+  if (pending.currentPageAttempt >= MAX_PAGE_ATTEMPTS) {
+    handlePageAttemptFailure(requestId, "MAX_ATTEMPTS_REACHED");
+    return;
+  }
+
+  pending.currentPageAttempt += 1;
+  const pageUrl = buildGoogleSearchUrl(pending.keyword, pending.currentStart);
+  console.log(
+    `[Rank Checker] Fetching Google URL: ${pageUrl} (attempt ${pending.currentPageAttempt}/${MAX_PAGE_ATTEMPTS})`,
+  );
+  openFreshIncognitoTab(requestId, pageUrl);
+}
+
+function openNextSearchPage(requestId: string): void {
+  const pending = pendingByRequestId.get(requestId);
+  if (!pending) {
+    return;
+  }
+
+  if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
+    finalizeRequest(requestId);
+    return;
+  }
+
+  pending.currentStart = GOOGLE_PAGE_STARTS[pending.currentPageIndex];
+  pending.currentPageAttempt = 0;
+  openSearchPageAttempt(requestId);
+}
+
+function parseGoogleResultsInTab(maxResults: number): ParsedSearchResult[] {
+  function safeText(node: Element | null): string {
+    return node?.textContent?.trim() ?? "";
+  }
+
+  function resolveResultUrl(rawHref: string): string {
+    if (!rawHref) {
+      return "";
+    }
+
+    const trimmed = rawHref.trim();
+    if (!trimmed) {
+      return "";
+    }
+
+    try {
+      const parsed = new URL(trimmed, window.location.origin);
+
+      if (parsed.pathname === "/url") {
+        const redirected = parsed.searchParams.get("q") ?? parsed.searchParams.get("url");
+        if (!redirected) {
+          return "";
+        }
+        return new URL(redirected).toString();
+      }
+
+      if (!/^https?:$/i.test(parsed.protocol)) {
+        return "";
+      }
+
+      const hostname = parsed.hostname.toLowerCase();
+      if (hostname.includes("google.")) {
+        return "";
+      }
+
+      return parsed.toString();
+    } catch {
+      return "";
+    }
+  }
+
+  function getPrimaryAnchor(block: Element): HTMLAnchorElement | null {
+    const heading = block.querySelector("h3");
+    if (heading) {
+      const headingAnchor = heading.closest("a");
+      if (headingAnchor instanceof HTMLAnchorElement) {
+        return headingAnchor;
+      }
+    }
+
+    return (
+      block.querySelector<HTMLAnchorElement>(".yuRUbf > a") ??
+      block.querySelector<HTMLAnchorElement>(".MjjYud a[href]") ??
+      block.querySelector<HTMLAnchorElement>("a[data-ved][href]") ??
+      block.querySelector<HTMLAnchorElement>("a[href]")
+    );
+  }
+
+  const seen = new Set<string>();
+  const collected: ParsedSearchResult[] = [];
+  const selectorGroups = [
+    "div#search .MjjYud",
+    "div#search .tF2Cxc",
+    "div#search .g",
+    "div#search .Gx5Zad",
+    "div#search div[data-sokoban-container]",
+  ];
+
+  for (const selector of selectorGroups) {
+    const blocks = document.querySelectorAll(selector);
+    for (const block of blocks) {
+      const heading = block.querySelector("h3");
+      if (!heading) {
+        continue;
+      }
+
+      const anchor = getPrimaryAnchor(block);
+      const rawHref = anchor?.getAttribute("href")?.trim() ?? "";
+      const url = resolveResultUrl(rawHref);
+      if (!url || seen.has(url)) {
+        continue;
+      }
+
+      const title =
+        safeText(block.querySelector("h3")) ||
+        safeText(block.querySelector("[role='heading']")) ||
+        safeText(anchor);
+      const snippet =
+        safeText(block.querySelector(".VwiC3b")) ||
+        safeText(block.querySelector(".aCOpRe")) ||
+        safeText(block.querySelector("span[data-sncf]"));
+
+      seen.add(url);
+      collected.push({
+        position: collected.length + 1,
+        url,
+        title,
+        snippet,
+      });
+
+      if (collected.length >= maxResults) {
+        return collected.slice(0, maxResults);
+      }
+    }
+  }
+
+  return collected.slice(0, maxResults);
+}
+
+function normalizeExecuteScriptResults(
+  injectionResults: chrome.scripting.InjectionResult<unknown>[] | undefined,
+): ParsedSearchResult[] {
+  if (!Array.isArray(injectionResults) || injectionResults.length === 0) {
+    return [];
+  }
+
+  const payload = injectionResults[0]?.result;
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  const normalized: ParsedSearchResult[] = [];
+  for (const entry of payload) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const candidate = entry as {
+      position?: unknown;
+      url?: unknown;
+      title?: unknown;
+      snippet?: unknown;
+    };
+
+    if (typeof candidate.url !== "string" || !candidate.url.trim()) {
+      continue;
+    }
+
+    normalized.push({
+      position: normalized.length + 1,
+      url: candidate.url.trim(),
+      title: typeof candidate.title === "string" ? candidate.title : "",
+      snippet: typeof candidate.snippet === "string" ? candidate.snippet : "",
+    });
+  }
+
+  return normalized.slice(0, RESULTS_PER_PAGE);
+}
+
+function executePageParse(requestId: string, tabId: number): void {
+  const pending = pendingByRequestId.get(requestId);
+  if (!pending) {
+    return;
+  }
+
+  chrome.scripting.executeScript(
     {
-      type: "PARSE_GOOGLE_SERP",
-      requestId,
-      pageStart: pending.currentStart ?? 0,
-      maxResults: RESULTS_PER_PAGE,
+      target: { tabId },
+      func: parseGoogleResultsInTab,
+      args: [RESULTS_PER_PAGE],
     },
-    () => {
+    (injectionResults) => {
       const runtimeError = chrome.runtime.lastError;
-      if (!runtimeError) {
-        return;
-      }
-
-      if (attempt >= CONTENT_SCRIPT_MAX_RETRIES) {
-        pending.sendResponse({
-          ok: false,
-          error: `Could not access Google page content in time: ${runtimeError.message}`,
-          code: "CONTENT_SCRIPT_UNAVAILABLE",
+      if (runtimeError) {
+        closeCurrentIncognitoTab(requestId, () => {
+          handlePageAttemptFailure(requestId, `EXECUTE_SCRIPT_FAILED: ${runtimeError.message}`);
         });
-        cleanupRequest(requestId);
         return;
       }
 
-      setTimeout(() => {
-        requestContentParse(tabId, requestId, attempt + 1);
-      }, CONTENT_SCRIPT_RETRY_DELAY_MS);
+      const results = normalizeExecuteScriptResults(injectionResults);
+      closeCurrentIncognitoTab(requestId, () => {
+        if (results.length === 0) {
+          handlePageAttemptFailure(requestId, "EMPTY_RESULTS");
+          return;
+        }
+
+        processPageResults(requestId, results);
+      });
     },
   );
 }
@@ -378,11 +625,14 @@ chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) =>
       targetDomain,
       windowId: null,
       tabId: null,
+      parseStartedTabId: null,
       currentStart: 0,
       currentPageIndex: 0,
+      currentPageAttempt: 0,
       pagesScanned: 0,
       collectedResults: [],
       timeoutId,
+      tabLoadTimeoutId: null,
       sendResponse,
     };
 
@@ -403,6 +653,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     return;
   }
 
+  const pending = pendingByRequestId.get(requestId);
+  if (!pending || pending.tabId !== tabId || pending.parseStartedTabId === tabId) {
+    return;
+  }
+
   chrome.tabs.get(tabId, (tab) => {
     const runtimeError = chrome.runtime.lastError;
     if (runtimeError || !tab?.url) {
@@ -412,99 +667,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     const isSupportedGoogleUrl =
       /^https:\/\/www\.google\.com\//i.test(tab.url) ||
       /^https:\/\/www\.google\.co\.in\//i.test(tab.url);
-
     if (!isSupportedGoogleUrl) {
       return;
     }
 
-    requestContentParse(tabId, requestId, 0);
-  });
-});
-
-chrome.runtime.onMessage.addListener((message, sender) => {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-
-  if ((message as { type?: string }).type !== "GOOGLE_SERP_PARSED") {
-    return;
-  }
-
-  const requestId =
-    typeof (message as { requestId?: unknown }).requestId === "string"
-      ? (message as { requestId: string }).requestId
-      : "";
-
-  const pending = pendingByRequestId.get(requestId);
-  if (!pending) {
-    return;
-  }
-
-  const senderTabId = sender.tab?.id;
-  if (!senderTabId || senderTabId !== pending.tabId) {
-    return;
-  }
-
-  const pageStart =
-    typeof (message as { pageStart?: unknown }).pageStart === "number"
-      ? (message as { pageStart: number }).pageStart
-      : -1;
-  if (pageStart !== pending.currentStart) {
-    return;
-  }
-  pending.pagesScanned += 1;
-
-  if ((message as { captchaDetected?: unknown }).captchaDetected) {
-    const captchaHtml =
-      typeof (message as { captchaHtml?: unknown }).captchaHtml === "string"
-        ? (message as { captchaHtml: string }).captchaHtml
-        : "";
-    const captchaUrl =
-      typeof (message as { captchaUrl?: unknown }).captchaUrl === "string"
-        ? (message as { captchaUrl: string }).captchaUrl
-        : "";
-
-    closeCurrentIncognitoTab(requestId, () => {
-      const activePending = pendingByRequestId.get(requestId);
-      if (!activePending) {
-        return;
-      }
-
-      activePending.sendResponse({
-        ok: false,
-        error:
-          "Google showed a CAPTCHA/blocked page for this request. Wait a few minutes and retry, or reduce request frequency.",
-        code: "CAPTCHA_DETECTED",
-        captchaHtml,
-        captchaUrl,
-      });
-      cleanupRequest(requestId);
-    });
-    return;
-  }
-
-  const results = Array.isArray((message as { results?: unknown[] }).results)
-    ? ((message as { results: unknown[] }).results as unknown[])
-    : [];
-
-  if (results.length > 0) {
-    pending.collectedResults.push(...results);
-    if (hasTargetDomain(results, pending.targetDomain)) {
-      closeCurrentIncognitoTab(requestId, () => {
-        finalizeRequest(requestId);
-      });
-      return;
-    }
-  }
-
-  pending.currentPageIndex += 1;
-  const hasMorePages = pending.currentPageIndex < GOOGLE_PAGE_STARTS.length;
-  closeCurrentIncognitoTab(requestId, () => {
-    if (!hasMorePages) {
-      finalizeRequest(requestId);
+    const activePending = pendingByRequestId.get(requestId);
+    if (!activePending || activePending.tabId !== tabId || activePending.parseStartedTabId === tabId) {
       return;
     }
 
-    scheduleNextSearchPage(requestId);
+    activePending.parseStartedTabId = tabId;
+    clearTabLoadTimeout(activePending);
+    executePageParse(requestId, tabId);
   });
 });

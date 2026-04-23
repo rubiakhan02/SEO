@@ -1,9 +1,10 @@
 "use strict";
 const REQUEST_TIMEOUT_MS = 240000;
+const TAB_LOAD_TIMEOUT_MS = 12000;
 const GOOGLE_PAGE_STARTS = Array.from({ length: 10 }, (_, index) => index * 10);
 const RESULTS_PER_PAGE = 10;
-const CONTENT_SCRIPT_RETRY_DELAY_MS = 400;
-const CONTENT_SCRIPT_MAX_RETRIES = 12;
+const MAX_PAGE_ATTEMPTS = 3;
+const PAGE_RETRY_DELAY_MS = 2000;
 const INCOGNITO_WARNING_MESSAGE = "Please enable incognito access for this extension. Go to chrome://extensions, click Details on the Rank Checker extension, and turn on Allow in Incognito. Then reload the extension.";
 const MIN_PAGE_DELAY_MS = 2000;
 const MAX_PAGE_DELAY_MS = 3500;
@@ -60,13 +61,13 @@ function hasTargetDomain(results, targetDomain) {
     if (!targetDomain) {
         return false;
     }
-    return results.some((item) => {
-        if (!item || typeof item !== "object") {
-            return false;
-        }
-        const result = item;
-        return isDomainMatch(result.url, targetDomain);
-    });
+    return results.some((result) => isDomainMatch(result.url, targetDomain));
+}
+function clearTabLoadTimeout(pending) {
+    if (pending.tabLoadTimeoutId !== null) {
+        clearTimeout(pending.tabLoadTimeoutId);
+        pending.tabLoadTimeoutId = null;
+    }
 }
 function attachIncognitoTabToRequest(requestId, windowId) {
     const pending = pendingByRequestId.get(requestId);
@@ -96,7 +97,18 @@ function attachIncognitoTabToRequest(requestId, windowId) {
         }
         pending.windowId = windowId;
         pending.tabId = firstTab.id;
+        pending.parseStartedTabId = null;
         pendingByTabId.set(firstTab.id, requestId);
+        clearTabLoadTimeout(pending);
+        pending.tabLoadTimeoutId = setTimeout(() => {
+            const activePending = pendingByRequestId.get(requestId);
+            if (!activePending || activePending.tabId !== firstTab.id) {
+                return;
+            }
+            closeCurrentIncognitoTab(requestId, () => {
+                handlePageAttemptFailure(requestId, "TAB_LOAD_TIMEOUT");
+            });
+        }, TAB_LOAD_TIMEOUT_MS);
     });
 }
 function openFreshIncognitoTab(requestId, pageUrl) {
@@ -125,8 +137,10 @@ function closeCurrentIncognitoTab(requestId, onClosed) {
     }
     const tabId = pending.tabId;
     const windowId = pending.windowId;
+    clearTabLoadTimeout(pending);
     pending.tabId = null;
     pending.windowId = null;
+    pending.parseStartedTabId = null;
     if (tabId) {
         pendingByTabId.delete(tabId);
         chrome.tabs.remove(tabId, () => {
@@ -158,6 +172,7 @@ function cleanupRequest(requestId) {
         return;
     }
     clearTimeout(pending.timeoutId);
+    clearTabLoadTimeout(pending);
     pendingByRequestId.delete(requestId);
     if (pending.tabId) {
         pendingByTabId.delete(pending.tabId);
@@ -191,21 +206,6 @@ function finalizeRequest(requestId) {
     });
     cleanupRequest(requestId);
 }
-function openNextSearchPage(requestId) {
-    const pending = pendingByRequestId.get(requestId);
-    if (!pending) {
-        return;
-    }
-    if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
-        finalizeRequest(requestId);
-        return;
-    }
-    const start = GOOGLE_PAGE_STARTS[pending.currentPageIndex];
-    pending.currentStart = start;
-    const pageUrl = buildGoogleSearchUrl(pending.keyword, start);
-    console.log(`[Rank Checker] Fetching Google URL: ${pageUrl}`);
-    openFreshIncognitoTab(requestId, pageUrl);
-}
 function scheduleNextSearchPage(requestId) {
     const pending = pendingByRequestId.get(requestId);
     if (!pending) {
@@ -216,33 +216,216 @@ function scheduleNextSearchPage(requestId) {
         openNextSearchPage(requestId);
     }, delayMs);
 }
-function requestContentParse(tabId, requestId, attempt = 0) {
+function processPageResults(requestId, results) {
     const pending = pendingByRequestId.get(requestId);
     if (!pending) {
         return;
     }
-    chrome.tabs.sendMessage(tabId, {
-        type: "PARSE_GOOGLE_SERP",
-        requestId,
-        pageStart: pending.currentStart ?? 0,
-        maxResults: RESULTS_PER_PAGE,
-    }, () => {
-        const runtimeError = chrome.runtime.lastError;
-        if (!runtimeError) {
+    pending.pagesScanned += 1;
+    if (results.length > 0) {
+        pending.collectedResults.push(...results);
+        if (hasTargetDomain(results, pending.targetDomain)) {
+            finalizeRequest(requestId);
             return;
         }
-        if (attempt >= CONTENT_SCRIPT_MAX_RETRIES) {
-            pending.sendResponse({
-                ok: false,
-                error: `Could not access Google page content in time: ${runtimeError.message}`,
-                code: "CONTENT_SCRIPT_UNAVAILABLE",
-            });
-            cleanupRequest(requestId);
-            return;
-        }
+    }
+    pending.currentPageIndex += 1;
+    pending.currentPageAttempt = 0;
+    if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
+        finalizeRequest(requestId);
+        return;
+    }
+    scheduleNextSearchPage(requestId);
+}
+function handlePageAttemptFailure(requestId, reason) {
+    const pending = pendingByRequestId.get(requestId);
+    if (!pending) {
+        return;
+    }
+    const pageNumber = pending.currentPageIndex + 1;
+    console.warn(`[Rank Checker] Page ${pageNumber} attempt ${pending.currentPageAttempt}/${MAX_PAGE_ATTEMPTS} failed: ${reason}`);
+    if (pending.currentPageAttempt < MAX_PAGE_ATTEMPTS) {
         setTimeout(() => {
-            requestContentParse(tabId, requestId, attempt + 1);
-        }, CONTENT_SCRIPT_RETRY_DELAY_MS);
+            openSearchPageAttempt(requestId);
+        }, PAGE_RETRY_DELAY_MS);
+        return;
+    }
+    pending.pagesScanned += 1;
+    pending.currentPageIndex += 1;
+    pending.currentPageAttempt = 0;
+    if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
+        finalizeRequest(requestId);
+        return;
+    }
+    scheduleNextSearchPage(requestId);
+}
+function openSearchPageAttempt(requestId) {
+    const pending = pendingByRequestId.get(requestId);
+    if (!pending) {
+        return;
+    }
+    if (pending.currentPageAttempt >= MAX_PAGE_ATTEMPTS) {
+        handlePageAttemptFailure(requestId, "MAX_ATTEMPTS_REACHED");
+        return;
+    }
+    pending.currentPageAttempt += 1;
+    const pageUrl = buildGoogleSearchUrl(pending.keyword, pending.currentStart);
+    console.log(`[Rank Checker] Fetching Google URL: ${pageUrl} (attempt ${pending.currentPageAttempt}/${MAX_PAGE_ATTEMPTS})`);
+    openFreshIncognitoTab(requestId, pageUrl);
+}
+function openNextSearchPage(requestId) {
+    const pending = pendingByRequestId.get(requestId);
+    if (!pending) {
+        return;
+    }
+    if (pending.currentPageIndex >= GOOGLE_PAGE_STARTS.length) {
+        finalizeRequest(requestId);
+        return;
+    }
+    pending.currentStart = GOOGLE_PAGE_STARTS[pending.currentPageIndex];
+    pending.currentPageAttempt = 0;
+    openSearchPageAttempt(requestId);
+}
+function parseGoogleResultsInTab(maxResults) {
+    function safeText(node) {
+        return node?.textContent?.trim() ?? "";
+    }
+    function resolveResultUrl(rawHref) {
+        if (!rawHref) {
+            return "";
+        }
+        const trimmed = rawHref.trim();
+        if (!trimmed) {
+            return "";
+        }
+        try {
+            const parsed = new URL(trimmed, window.location.origin);
+            if (parsed.pathname === "/url") {
+                const redirected = parsed.searchParams.get("q") ?? parsed.searchParams.get("url");
+                if (!redirected) {
+                    return "";
+                }
+                return new URL(redirected).toString();
+            }
+            if (!/^https?:$/i.test(parsed.protocol)) {
+                return "";
+            }
+            const hostname = parsed.hostname.toLowerCase();
+            if (hostname.includes("google.")) {
+                return "";
+            }
+            return parsed.toString();
+        }
+        catch {
+            return "";
+        }
+    }
+    function getPrimaryAnchor(block) {
+        const heading = block.querySelector("h3");
+        if (heading) {
+            const headingAnchor = heading.closest("a");
+            if (headingAnchor instanceof HTMLAnchorElement) {
+                return headingAnchor;
+            }
+        }
+        return (block.querySelector(".yuRUbf > a") ??
+            block.querySelector(".MjjYud a[href]") ??
+            block.querySelector("a[data-ved][href]") ??
+            block.querySelector("a[href]"));
+    }
+    const seen = new Set();
+    const collected = [];
+    const selectorGroups = [
+        "div#search .MjjYud",
+        "div#search .tF2Cxc",
+        "div#search .g",
+        "div#search .Gx5Zad",
+        "div#search div[data-sokoban-container]",
+    ];
+    for (const selector of selectorGroups) {
+        const blocks = document.querySelectorAll(selector);
+        for (const block of blocks) {
+            const heading = block.querySelector("h3");
+            if (!heading) {
+                continue;
+            }
+            const anchor = getPrimaryAnchor(block);
+            const rawHref = anchor?.getAttribute("href")?.trim() ?? "";
+            const url = resolveResultUrl(rawHref);
+            if (!url || seen.has(url)) {
+                continue;
+            }
+            const title = safeText(block.querySelector("h3")) ||
+                safeText(block.querySelector("[role='heading']")) ||
+                safeText(anchor);
+            const snippet = safeText(block.querySelector(".VwiC3b")) ||
+                safeText(block.querySelector(".aCOpRe")) ||
+                safeText(block.querySelector("span[data-sncf]"));
+            seen.add(url);
+            collected.push({
+                position: collected.length + 1,
+                url,
+                title,
+                snippet,
+            });
+            if (collected.length >= maxResults) {
+                return collected.slice(0, maxResults);
+            }
+        }
+    }
+    return collected.slice(0, maxResults);
+}
+function normalizeExecuteScriptResults(injectionResults) {
+    if (!Array.isArray(injectionResults) || injectionResults.length === 0) {
+        return [];
+    }
+    const payload = injectionResults[0]?.result;
+    if (!Array.isArray(payload)) {
+        return [];
+    }
+    const normalized = [];
+    for (const entry of payload) {
+        if (!entry || typeof entry !== "object") {
+            continue;
+        }
+        const candidate = entry;
+        if (typeof candidate.url !== "string" || !candidate.url.trim()) {
+            continue;
+        }
+        normalized.push({
+            position: normalized.length + 1,
+            url: candidate.url.trim(),
+            title: typeof candidate.title === "string" ? candidate.title : "",
+            snippet: typeof candidate.snippet === "string" ? candidate.snippet : "",
+        });
+    }
+    return normalized.slice(0, RESULTS_PER_PAGE);
+}
+function executePageParse(requestId, tabId) {
+    const pending = pendingByRequestId.get(requestId);
+    if (!pending) {
+        return;
+    }
+    chrome.scripting.executeScript({
+        target: { tabId },
+        func: parseGoogleResultsInTab,
+        args: [RESULTS_PER_PAGE],
+    }, (injectionResults) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+            closeCurrentIncognitoTab(requestId, () => {
+                handlePageAttemptFailure(requestId, `EXECUTE_SCRIPT_FAILED: ${runtimeError.message}`);
+            });
+            return;
+        }
+        const results = normalizeExecuteScriptResults(injectionResults);
+        closeCurrentIncognitoTab(requestId, () => {
+            if (results.length === 0) {
+                handlePageAttemptFailure(requestId, "EMPTY_RESULTS");
+                return;
+            }
+            processPageResults(requestId, results);
+        });
     });
 }
 chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) => {
@@ -302,11 +485,14 @@ chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) =>
             targetDomain,
             windowId: null,
             tabId: null,
+            parseStartedTabId: null,
             currentStart: 0,
             currentPageIndex: 0,
+            currentPageAttempt: 0,
             pagesScanned: 0,
             collectedResults: [],
             timeoutId,
+            tabLoadTimeoutId: null,
             sendResponse,
         };
         pendingByRequestId.set(requestId, pending);
@@ -322,6 +508,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (!requestId) {
         return;
     }
+    const pending = pendingByRequestId.get(requestId);
+    if (!pending || pending.tabId !== tabId || pending.parseStartedTabId === tabId) {
+        return;
+    }
     chrome.tabs.get(tabId, (tab) => {
         const runtimeError = chrome.runtime.lastError;
         if (runtimeError || !tab?.url) {
@@ -332,76 +522,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
         if (!isSupportedGoogleUrl) {
             return;
         }
-        requestContentParse(tabId, requestId, 0);
-    });
-});
-chrome.runtime.onMessage.addListener((message, sender) => {
-    if (!message || typeof message !== "object") {
-        return;
-    }
-    if (message.type !== "GOOGLE_SERP_PARSED") {
-        return;
-    }
-    const requestId = typeof message.requestId === "string"
-        ? message.requestId
-        : "";
-    const pending = pendingByRequestId.get(requestId);
-    if (!pending) {
-        return;
-    }
-    const senderTabId = sender.tab?.id;
-    if (!senderTabId || senderTabId !== pending.tabId) {
-        return;
-    }
-    const pageStart = typeof message.pageStart === "number"
-        ? message.pageStart
-        : -1;
-    if (pageStart !== pending.currentStart) {
-        return;
-    }
-    pending.pagesScanned += 1;
-    if (message.captchaDetected) {
-        const captchaHtml = typeof message.captchaHtml === "string"
-            ? message.captchaHtml
-            : "";
-        const captchaUrl = typeof message.captchaUrl === "string"
-            ? message.captchaUrl
-            : "";
-        closeCurrentIncognitoTab(requestId, () => {
-            const activePending = pendingByRequestId.get(requestId);
-            if (!activePending) {
-                return;
-            }
-            activePending.sendResponse({
-                ok: false,
-                error: "Google showed a CAPTCHA/blocked page for this request. Wait a few minutes and retry, or reduce request frequency.",
-                code: "CAPTCHA_DETECTED",
-                captchaHtml,
-                captchaUrl,
-            });
-            cleanupRequest(requestId);
-        });
-        return;
-    }
-    const results = Array.isArray(message.results)
-        ? message.results
-        : [];
-    if (results.length > 0) {
-        pending.collectedResults.push(...results);
-        if (hasTargetDomain(results, pending.targetDomain)) {
-            closeCurrentIncognitoTab(requestId, () => {
-                finalizeRequest(requestId);
-            });
+        const activePending = pendingByRequestId.get(requestId);
+        if (!activePending || activePending.tabId !== tabId || activePending.parseStartedTabId === tabId) {
             return;
         }
-    }
-    pending.currentPageIndex += 1;
-    const hasMorePages = pending.currentPageIndex < GOOGLE_PAGE_STARTS.length;
-    closeCurrentIncognitoTab(requestId, () => {
-        if (!hasMorePages) {
-            finalizeRequest(requestId);
-            return;
-        }
-        scheduleNextSearchPage(requestId);
+        activePending.parseStartedTabId = tabId;
+        clearTabLoadTimeout(activePending);
+        executePageParse(requestId, tabId);
     });
 });
