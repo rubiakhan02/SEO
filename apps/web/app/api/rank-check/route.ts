@@ -72,30 +72,34 @@ export async function POST(request: Request) {
     );
   }
 
-  const rawResults: RawSearchResult[] = payload.results
-    .map((item, index) => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
+  const rawResults = payload.results.reduce<RawSearchResult[]>((accumulator, item, index) => {
+    if (!item || typeof item !== "object") {
+      return accumulator;
+    }
 
-      const candidate = item as Record<string, unknown>;
-      const url = typeof candidate.url === "string" ? candidate.url : "";
-      const title = typeof candidate.title === "string" ? candidate.title : undefined;
-      const snippet = typeof candidate.snippet === "string" ? candidate.snippet : undefined;
-      const position = typeof candidate.position === "number" ? candidate.position : index + 1;
+    const candidate = item as Record<string, unknown>;
+    const url = typeof candidate.url === "string" ? candidate.url : "";
 
-      if (!url) {
-        return null;
-      }
+    if (!url) {
+      return accumulator;
+    }
 
-      return {
-        url,
-        title,
-        snippet,
-        position,
-      };
-    })
-    .filter((item): item is RawSearchResult => Boolean(item));
+    const rawResult: RawSearchResult = {
+      url,
+      position: typeof candidate.position === "number" ? candidate.position : index + 1,
+    };
+
+    if (typeof candidate.title === "string") {
+      rawResult.title = candidate.title;
+    }
+
+    if (typeof candidate.snippet === "string") {
+      rawResult.snippet = candidate.snippet;
+    }
+
+    accumulator.push(rawResult);
+    return accumulator;
+  }, []);
 
   const requestedScannedCount =
     typeof payload.scannedCount === "number" && Number.isFinite(payload.scannedCount)
